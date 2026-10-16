@@ -9,6 +9,7 @@ import torch.nn as nn
 from gnn_data import GNN_DATA
 # from gnn_models_sag import GIN_Net2, ppi_model
 from gnn_models_sag import ppi_model
+from lspe import build_lspe
 from utils import Metrictor_PPI, print_file
 from tensorboardX import SummaryWriter
 
@@ -30,6 +31,16 @@ parser.add_argument('--save_path', default=None, type=str,
                     help="save folder")
 parser.add_argument('--epoch_num', default=None, type=int,
                     help='train epoch number')
+parser.add_argument('--split_path', default='./train_val_split_data/train_val_split_1.json', type=str,
+                    help='path for the train/validation split JSON')
+parser.add_argument('--reuse_split', action='store_true',
+                    help='reuse split_path instead of generating a new random split')
+parser.add_argument('--use_lspe', action='store_true',
+                    help='enable PPI-graph RWPE+LapPE')
+parser.add_argument('--rwpe_dim', default=8, type=int,
+                    help='number of random-walk positional encoding channels')
+parser.add_argument('--lappe_dim', default=8, type=int,
+                    help='number of Laplacian positional encoding channels')
 seed_num = 2
 np.random.seed(seed_num)
 torch.manual_seed(seed_num)
@@ -90,7 +101,7 @@ def boolean_string(s):
 def train(batch, p_x_all, p_edge_all, model, graph, ppi_list, loss_fn, optimizer, device,
           result_file_path, summary_writer, save_path,
           batch_size=512, epochs=1000, scheduler=None,
-          got=False):
+          got=False, ppi_pe=None, model_config=None):
     global_step = 0
     global_best_valid_f1 = 0.0
     global_best_valid_f1_epoch = 0
@@ -132,10 +143,12 @@ def train(batch, p_x_all, p_edge_all, model, graph, ppi_list, loss_fn, optimizer
                     train_edge_id = graph.train_mask[step * batch_size: step * batch_size + batch_size]
 
             if got:
-                output = model(batch, p_x_all, p_edge_all, graph.edge_index_got, train_edge_id)
+                output = model(batch, p_x_all, p_edge_all, graph.edge_index_got,
+                               train_edge_id, ppi_pe=ppi_pe)
                 label = graph.edge_attr_got[train_edge_id]
             else:
-                output = model(batch, p_x_all, p_edge_all, graph.edge_index, train_edge_id)
+                output = model(batch, p_x_all, p_edge_all, graph.edge_index,
+                               train_edge_id, ppi_pe=ppi_pe)
                 label = graph.edge_attr_1[train_edge_id]
 
             label = label.type(torch.FloatTensor).to(device)
@@ -168,7 +181,8 @@ def train(batch, p_x_all, p_edge_all, model, graph, ppi_list, loss_fn, optimizer
                        .format(epoch, step, loss.item(), metrics.Precision, metrics.Recall, metrics.F1))
 
         torch.save({'epoch': epoch,
-                    'state_dict': model.state_dict()},
+                    'state_dict': model.state_dict(),
+                    'model_config': model_config},
                    os.path.join(save_path, 'gnn_model_train.ckpt'))
 
         valid_pre_result_list = []
@@ -187,7 +201,8 @@ def train(batch, p_x_all, p_edge_all, model, graph, ppi_list, loss_fn, optimizer
                 else:
                     valid_edge_id = graph.val_mask[step * batch_size: step * batch_size + batch_size]
 
-                output = model(batch, p_x_all, p_edge_all, graph.edge_index, valid_edge_id)
+                output = model(batch, p_x_all, p_edge_all, graph.edge_index,
+                               valid_edge_id, ppi_pe=ppi_pe)
                 label = graph.edge_attr_1[valid_edge_id]
                 label = label.type(torch.FloatTensor).to(device)
 
@@ -226,7 +241,8 @@ def train(batch, p_x_all, p_edge_all, model, graph, ppi_list, loss_fn, optimizer
             global_best_valid_f1_epoch = epoch
 
             torch.save({'epoch': epoch,
-                        'state_dict': model.state_dict()},
+                        'state_dict': model.state_dict(),
+                        'model_config': model_config},
                        os.path.join(save_path, 'gnn_model_valid_best.ckpt'))
 
         summary_writer.add_scalar('valid/precision', metrics.Precision, global_step)
@@ -248,7 +264,7 @@ def main():
                                 vec_path=args.vec_path)
 
     ppi_data.generate_data()
-    ppi_data.split_dataset(train_valid_index_path='./train_val_split_data/train_val_split_1.json', random_new=True,
+    ppi_data.split_dataset(train_valid_index_path=args.split_path, random_new=not args.reuse_split,
                            mode=args.split)
     graph = ppi_data.data
     ppi_list = ppi_data.ppi_list
@@ -276,13 +292,25 @@ def main():
     graph.edge_attr_got = torch.cat((graph.edge_attr_1[graph.train_mask], graph.edge_attr_1[graph.train_mask]), dim=0)
     graph.train_mask_got = [i for i in range(len(graph.train_mask))]
 
+    ppi_pe = None
+    if args.use_lspe:
+        ppi_pe = build_lspe(
+            graph.edge_index_got,
+            num_nodes=ppi_data.node_num,
+            rwpe_dim=args.rwpe_dim,
+            lappe_dim=args.lappe_dim,
+        )
+
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     print(device)
 
     graph.to(device)
 
     # model = GIN_Net2(in_len=2000, in_feature=13, gin_in_feature=256, num_layers=1, pool_size=3, cnn_hidden=1).to(device)
-    model = ppi_model()
+    model = ppi_model(
+        use_lspe=args.use_lspe,
+        pe_dim=args.rwpe_dim + args.lappe_dim,
+    )
     model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=5e-4)
 
@@ -308,7 +336,14 @@ def main():
     train(batch, p_x_all, p_edge_all, model, graph, ppi_list, loss_fn, optimizer, device,
           result_file_path, summary_writer, save_path,
           batch_size=11000, epochs=args.epoch_num, scheduler=scheduler,
-          got=True)
+          got=True, ppi_pe=ppi_pe,
+          model_config={
+              'use_lspe': args.use_lspe,
+              'rwpe_dim': args.rwpe_dim,
+              'lappe_dim': args.lappe_dim,
+              'pe_source': 'training_graph',
+              'split_path': args.split_path,
+          })
 
     summary_writer.close()
 

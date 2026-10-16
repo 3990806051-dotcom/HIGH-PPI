@@ -9,10 +9,10 @@ import torch
 import torch.nn as nn
 
 from tqdm import tqdm
-from gnn_models_sag import GIN_Net2, ppi_model
+from gnn_models_sag import ppi_model
 from gnn_data import GNN_DATA
-from gnn_models_sag import GIN_Net2
 from utils import Metrictor_PPI, print_file
+from lspe import build_lspe
 parser = argparse.ArgumentParser(description='HIGH-PPI_model_training')
 
 parser.add_argument('--ppi_path', default=None, type=str,
@@ -29,6 +29,12 @@ parser.add_argument('--index_path', default=None, type=str,
                     help='training and test PPI index')
 parser.add_argument('--model_path', default=None, type=str,
                     help="path for trained model")
+parser.add_argument('--use_lspe', action='store_true',
+                    help='enable PPI-graph RWPE+LapPE')
+parser.add_argument('--rwpe_dim', default=8, type=int,
+                    help='number of random-walk positional encoding channels')
+parser.add_argument('--lappe_dim', default=8, type=int,
+                    help='number of Laplacian positional encoding channels')
 
 def multi2big_x(x_ori):
     x_cat = torch.zeros(1, 7)
@@ -82,7 +88,7 @@ def boolean_string(s):
     return s == 'True'
 
 
-def test(model, graph, test_mask, device,batch, p_x_all, p_edge_all):
+def test(model, graph, test_mask, device, batch, p_x_all, p_edge_all, ppi_pe=None):
     valid_pre_result_list = []
     valid_label_list = []
 
@@ -102,7 +108,8 @@ def test(model, graph, test_mask, device,batch, p_x_all, p_edge_all):
             valid_edge_id = test_mask[step*batch_size : step*batch_size + batch_size]
 
         # output = model(graph.x, graph.edge_index, valid_edge_id)
-        output = model(batch, p_x_all, p_edge_all, graph.edge_index, valid_edge_id)
+        output = model(batch, p_x_all, p_edge_all, graph.edge_index,
+                       valid_edge_id, ppi_pe=ppi_pe)
         label = graph.edge_attr_1[valid_edge_id]
         label = label.type(torch.FloatTensor).to(device)
 
@@ -199,12 +206,36 @@ def main():
     graph.test2_mask = test2_mask
     graph.test3_mask = test3_mask
 
-    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-
-    model = ppi_model()
-    model.to(device)
     model_path = args.model_path
-    model.load_state_dict(torch.load(model_path)['state_dict'])
+    checkpoint = torch.load(model_path, map_location='cpu')
+    saved_config = checkpoint.get('model_config') or {}
+    use_lspe = args.use_lspe or saved_config.get('use_lspe', False)
+    rwpe_dim = saved_config.get('rwpe_dim', args.rwpe_dim)
+    lappe_dim = saved_config.get('lappe_dim', args.lappe_dim)
+
+    train_edge_index = torch.cat(
+        (
+            graph.edge_index[:, graph.train_mask],
+            graph.edge_index[:, graph.train_mask][[1, 0]],
+        ),
+        dim=1,
+    )
+    ppi_pe = None
+    if use_lspe:
+        ppi_pe = build_lspe(
+            train_edge_index,
+            num_nodes=ppi_data.node_num,
+            rwpe_dim=rwpe_dim,
+            lappe_dim=lappe_dim,
+        )
+
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    model = ppi_model(
+        use_lspe=use_lspe,
+        pe_dim=rwpe_dim + lappe_dim,
+    )
+    model.to(device)
+    model.load_state_dict(checkpoint['state_dict'])
 
     graph.to(device)
 
@@ -228,7 +259,8 @@ def main():
 
 
 
-    test(model, graph, graph.val_mask, device,batch, p_x_all, p_edge_all)
+    test(model, graph, graph.val_mask, device, batch, p_x_all, p_edge_all,
+         ppi_pe=ppi_pe)
     
 if __name__ == "__main__":
     main()

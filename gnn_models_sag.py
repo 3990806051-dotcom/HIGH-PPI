@@ -13,9 +13,12 @@ from torch_geometric.nn import global_mean_pool
 
 
 class GIN(torch.nn.Module):
-    def __init__(self,  hidden=512, train_eps=True, class_num=7):
+    def __init__(self, hidden=512, train_eps=True, class_num=7, pe_dim=0):
         super(GIN, self).__init__()
         self.train_eps = train_eps
+        self.pe_dim = pe_dim
+        if pe_dim:
+            self.pe_projection = nn.Linear(pe_dim, 128)
         self.gin_conv1 = GINConv(
             nn.Sequential(
                 nn.Linear(128, hidden),
@@ -64,7 +67,16 @@ class GIN(torch.nn.Module):
         self.fc2.reset_parameters()
 
 
-    def forward(self, x, edge_index, train_edge_id, p=0.5):
+    def forward(self, x, edge_index, train_edge_id, ppi_pe=None, p=0.5):
+
+        if self.pe_dim:
+            if ppi_pe is None:
+                raise ValueError("ppi_pe is required when LSPE is enabled")
+            if ppi_pe.shape[0] != x.shape[0] or ppi_pe.shape[1] != self.pe_dim:
+                raise ValueError(
+                    "ppi_pe must have shape [num_proteins, {}]".format(self.pe_dim)
+                )
+            x = x + self.pe_projection(ppi_pe)
 
         x = self.gin_conv1(x, edge_index)
         x = self.gin_conv2(x, edge_index)
@@ -157,16 +169,24 @@ class GCN(nn.Module):
 
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 class ppi_model(nn.Module):
-    def __init__(self):
+    def __init__(self, use_lspe=False, pe_dim=16):
         super(ppi_model,self).__init__()
         self.BGNN = GCN()
-        self.TGNN = GIN()
+        self.use_lspe = use_lspe
+        self.pe_dim = pe_dim if use_lspe else 0
+        self.TGNN = GIN(pe_dim=self.pe_dim)
 
-    def forward(self, batch, p_x_all, p_edge_all, edge_index, train_edge_id, p=0.5):
+    def forward(self, batch, p_x_all, p_edge_all, edge_index, train_edge_id,
+                ppi_pe=None, p=0.5):
         edge_index = edge_index.to(device)
         batch = batch.to(torch.int64).to(device)
         x = p_x_all.to(torch.float32).to(device)
         edge = torch.LongTensor(p_edge_all.to(torch.int64)).to(device)
         embs = self.BGNN(x, edge, batch-1)
-        final = self.TGNN(embs, edge_index, train_edge_id, p=0.5)
+        if self.use_lspe:
+            if ppi_pe is None:
+                raise ValueError("ppi_pe is required when LSPE is enabled")
+            ppi_pe = ppi_pe.to(device=device, dtype=embs.dtype)
+        final = self.TGNN(embs, edge_index, train_edge_id,
+                          ppi_pe=ppi_pe, p=p)
         return final
